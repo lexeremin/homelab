@@ -22,6 +22,12 @@ confirm() { read -rp "  $* [y/N] " r; [[ "${r,,}" == "y" ]]; }
 
 need() { command -v "$1" &>/dev/null || die "'$1' not found — $2"; }
 
+# ── AmneziaWG key generation (via container, no wireguard-tools needed) ──
+awg_run()     { docker run --rm "${IMAGE}" awg "$@"; }
+gen_privkey() { awg_run genkey; }
+gen_pubkey()  { echo "$1" | docker run --rm -i "${IMAGE}" awg pubkey; }
+gen_psk()     { awg_run genpsk; }
+
 env_set() {
   local key="$1" val="$2"
   if grep -q "^${key}=" "$ENV_FILE"; then
@@ -87,13 +93,15 @@ is_setup() { [[ -f "${CONFIG_DIR}/awg0.conf" ]]; }
 # ══════════════════════════════════════════════════════════════════
 menu_setup() {
   is_setup && { echo "  Server already set up. Run 'remove setup' first to reset."; return; }
-  need wg     "apt install wireguard-tools"
   need docker "https://docs.docker.com/engine/install/"
 
-  step "Generating server keys"
-  SERVER_PRIVKEY=$(wg genkey)
-  SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
-  PSK=$(wg genpsk)
+  step "Pulling image: ${IMAGE}"
+  docker pull "${IMAGE}"
+
+  step "Generating server keys (via awg)"
+  SERVER_PRIVKEY=$(gen_privkey)
+  SERVER_PUBKEY=$(gen_pubkey "$SERVER_PRIVKEY")
+  PSK=$(gen_psk)
   info "Server pubkey: ${SERVER_PUBKEY}"
 
   step "Generating Amnezia H values"
@@ -177,7 +185,7 @@ _setup_iptables() {
 # ══════════════════════════════════════════════════════════════════
 menu_add_client() {
   is_setup || die "Server not set up. Run setup first."
-  need wg "apt install wireguard-tools"
+  need docker "https://docs.docker.com/engine/install/"
 
   read -rp "  Client name: " name
   [[ -n "$name" ]] || die "Name cannot be empty."
@@ -185,9 +193,9 @@ menu_add_client() {
   # Check name not already taken
   list_clients | grep -qx "$name" && die "Client '${name}' already exists."
 
-  step "Generating keys for '${name}'"
-  CLIENT_PRIVKEY=$(wg genkey)
-  CLIENT_PUBKEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
+  step "Generating keys for '${name}' (via awg)"
+  CLIENT_PRIVKEY=$(gen_privkey)
+  CLIENT_PUBKEY=$(gen_pubkey "$CLIENT_PRIVKEY")
 
   _JC=$(conf_get Jc);   _JMIN=$(conf_get Jmin); _JMAX=$(conf_get Jmax)
   _S1=$(conf_get S1);   _S2=$(conf_get S2);     _S3=$(conf_get S3); _S4=$(conf_get S4)
