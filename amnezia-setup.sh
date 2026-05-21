@@ -56,39 +56,38 @@ gen_h_values() {
   export H1 H2 H3 H4
 }
 
-conf_get() { grep "^${1} = " "${CONFIG_DIR}/awg0.conf" | head -1 | awk '{print $3}'; }
+conf_get() { sudo grep "^${1} = " "${CONFIG_DIR}/awg0.conf" | head -1 | awk '{print $3}'; }
 
 next_client_ip() {
   local last=0 n
   while read -r n; do
     [[ "$n" -gt "$last" ]] && last="$n"
-  done < <(grep "^AllowedIPs = ${VPN_PREFIX}\." "${CONFIG_DIR}/awg0.conf" \
+  done < <(sudo grep "^AllowedIPs = ${VPN_PREFIX}\." "${CONFIG_DIR}/awg0.conf" \
             | grep -oP "\.\K[0-9]+(?=/32)" || true)
   echo "$((last + 1))"
 }
 
 # List client names from awg0.conf
 list_clients() {
-  grep "^# Client: " "${CONFIG_DIR}/awg0.conf" | sed 's/^# Client: //' || true
+  sudo grep "^# Client: " "${CONFIG_DIR}/awg0.conf" | sed 's/^# Client: //' || true
 }
 
 # Get public key for a named client
 client_pubkey() {
   local name="$1"
-  awk "/^# Client: ${name}$/{found=1} found && /^PublicKey/{print \$3; exit}" \
+  sudo awk "/^# Client: ${name}$/{found=1} found && /^PublicKey/{print \$3; exit}" \
     "${CONFIG_DIR}/awg0.conf"
 }
 
 # Remove a client block from awg0.conf (by name)
 remove_client_block() {
   local name="$1"
-  python3 - << EOF
+  sudo python3 - << EOF
 import re
 
 with open("${CONFIG_DIR}/awg0.conf", "r") as f:
     content = f.read()
 
-# Remove blank line(s) + comment + [Peer] block for this client
 pattern = r'\n+# Client: ${name}\n\[Peer\](?:[^\[]*)'
 content = re.sub(pattern, '', content)
 
@@ -97,7 +96,7 @@ with open("${CONFIG_DIR}/awg0.conf", "w") as f:
 EOF
 }
 
-is_setup() { [[ -f "${CONFIG_DIR}/awg0.conf" ]]; }
+is_setup() { sudo test -f "${CONFIG_DIR}/awg0.conf"; }
 
 # ══════════════════════════════════════════════════════════════════
 menu_setup() {
@@ -209,8 +208,8 @@ menu_add_client() {
   _JC=$(conf_get Jc);   _JMIN=$(conf_get Jmin); _JMAX=$(conf_get Jmax)
   _S1=$(conf_get S1);   _S2=$(conf_get S2);     _S3=$(conf_get S3); _S4=$(conf_get S4)
   _H1=$(conf_get H1);   _H2=$(conf_get H2);     _H3=$(conf_get H3); _H4=$(conf_get H4)
-  _SERVER_PUBKEY=$(cat "${CONFIG_DIR}/wireguard_server_public_key.key")
-  _PSK=$(cat "${CONFIG_DIR}/wireguard_psk.key")
+  _SERVER_PUBKEY=$(sudo cat "${CONFIG_DIR}/wireguard_server_public_key.key")
+  _PSK=$(sudo cat "${CONFIG_DIR}/wireguard_psk.key")
 
   local n CLIENT_VPN_IP
   n=$(next_client_ip)
