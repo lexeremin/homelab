@@ -22,10 +22,19 @@ confirm() { read -rp "  $* [y/N] " r; [[ "${r,,}" == "y" ]]; }
 
 need() { command -v "$1" &>/dev/null || die "'$1' not found — $2"; }
 
+# ── Docker wrapper (auto-detects if sudo is needed) ───────────────
+if docker info &>/dev/null 2>&1; then
+  DOCKER="docker"
+elif sudo docker info &>/dev/null 2>&1; then
+  DOCKER="sudo docker"
+else
+  die "Docker not reachable. Install Docker or add user to docker group."
+fi
+
 # ── AmneziaWG key generation (via container, no wireguard-tools needed) ──
-awg_run()     { docker run --rm "${IMAGE}" awg "$@"; }
+awg_run()     { $DOCKER run --rm "${IMAGE}" awg "$@"; }
 gen_privkey() { awg_run genkey; }
-gen_pubkey()  { echo "$1" | docker run --rm -i "${IMAGE}" awg pubkey; }
+gen_pubkey()  { echo "$1" | $DOCKER run --rm -i "${IMAGE}" awg pubkey; }
 gen_psk()     { awg_run genpsk; }
 
 env_set() {
@@ -96,7 +105,7 @@ menu_setup() {
   need docker "https://docs.docker.com/engine/install/"
 
   step "Pulling image: ${IMAGE}"
-  docker pull "${IMAGE}"
+  $DOCKER pull "${IMAGE}"
 
   step "Generating server keys (via awg)"
   SERVER_PRIVKEY=$(gen_privkey)
@@ -140,14 +149,14 @@ EOF
   env_set H1 "$H1"; env_set H2 "$H2"; env_set H3 "$H3"; env_set H4 "$H4"
 
   step "Creating Docker network (bridge: ${DOCKER_BRIDGE})"
-  docker network create \
+  $DOCKER network create \
     --driver bridge \
     --opt com.docker.network.bridge.name="${DOCKER_BRIDGE}" \
     "${DOCKER_NET}" 2>/dev/null && info "Created" || info "Already exists"
 
   step "Starting container: ${CONTAINER_NAME}"
-  docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
-  docker run -d \
+  $DOCKER rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  $DOCKER run -d \
     --name "${CONTAINER_NAME}" \
     --network "${DOCKER_NET}" \
     --cap-add NET_ADMIN \
@@ -219,12 +228,12 @@ AllowedIPs = ${CLIENT_VPN_IP}/32
 EOF
 
   step "Hot-adding peer to running interface"
-  docker exec "${CONTAINER_NAME}" sh -c "printf '%s' '${_PSK}' > /tmp/psk.key"
-  docker exec "${CONTAINER_NAME}" awg set awg0 \
+  $DOCKER exec "${CONTAINER_NAME}" sh -c "printf '%s' '${_PSK}' > /tmp/psk.key"
+  $DOCKER exec "${CONTAINER_NAME}" awg set awg0 \
     peer "${CLIENT_PUBKEY}" \
     preshared-key /tmp/psk.key \
     allowed-ips "${CLIENT_VPN_IP}/32"
-  docker exec "${CONTAINER_NAME}" rm /tmp/psk.key
+  $DOCKER exec "${CONTAINER_NAME}" rm /tmp/psk.key
 
   local outfile="${SCRIPT_DIR}/homelab_${name}_$(date +%Y_%m_%d).conf"
   step "Writing → $(basename "$outfile")"
@@ -285,7 +294,7 @@ menu_remove_client() {
   [[ -n "$pubkey" ]] || die "Could not find public key for '${name}'."
 
   step "Removing peer from running interface"
-  docker exec "${CONTAINER_NAME}" awg set awg0 peer "${pubkey}" remove
+  $DOCKER exec "${CONTAINER_NAME}" awg set awg0 peer "${pubkey}" remove
 
   step "Removing peer from server config"
   remove_client_block "$name"
@@ -307,10 +316,10 @@ menu_remove_setup() {
   confirm "Proceed with full teardown?" || { echo "  Aborted."; return; }
 
   step "Stopping container"
-  docker rm -f "${CONTAINER_NAME}" 2>/dev/null && info "Removed" || info "Not running"
+  $DOCKER rm -f "${CONTAINER_NAME}" 2>/dev/null && info "Removed" || info "Not running"
 
   step "Removing Docker network"
-  docker network rm "${DOCKER_NET}" 2>/dev/null && info "Removed" || info "Not found"
+  $DOCKER network rm "${DOCKER_NET}" 2>/dev/null && info "Removed" || info "Not found"
 
   step "Removing config directory"
   sudo rm -rf "${CONFIG_DIR}" && info "Removed ${CONFIG_DIR}"
