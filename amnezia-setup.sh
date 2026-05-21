@@ -166,12 +166,13 @@ EOF
 }
 
 # Start (or restart) the AmneziaWG container.
-# amneziawg-go exits early on modern kernels detecting WireGuard support;
-# WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 forces the userspace daemon.
-# /dev/net/tun is required for the TUN interface it creates.
+# Requires the amneziawg kernel module loaded on the host.
+# The container uses 'ip link add type amneziawg' to create a kernel interface,
+# then awg setconf to apply config, then iptables MASQUERADE for client NAT.
 _start_container() {
-  local cmd="WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 amneziawg-go awg0 \
-    && sleep 0.5 \
+  lsmod | grep -q amneziawg || die "amneziawg kernel module not loaded. Run: sudo modprobe amneziawg"
+
+  local cmd="ip link add dev awg0 type amneziawg \
     && grep -v '^Address = ' '${CONFIG_DIR}/awg0.conf' | awg setconf awg0 /dev/stdin \
     && ip addr add '${VPN_PREFIX}.0/24' dev awg0 \
     && ip link set awg0 up \
@@ -185,7 +186,6 @@ _start_container() {
     --cap-add SYS_MODULE \
     --sysctl net.ipv4.ip_forward=1 \
     --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-    --device /dev/net/tun:/dev/net/tun \
     -v "${CONFIG_DIR}:${CONFIG_DIR}" \
     -p "${SERVER_PORT}:${SERVER_PORT}/udp" \
     --restart unless-stopped \
