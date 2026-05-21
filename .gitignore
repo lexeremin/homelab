@@ -1,0 +1,6 @@
+# Secrets — never commit
+.env
+*.conf
+
+# Claude context
+CLAUDE.md
