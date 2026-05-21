@@ -170,7 +170,9 @@ EOF
 # The container uses 'ip link add type amneziawg' to create a kernel interface,
 # then awg setconf to apply config, then iptables MASQUERADE for client NAT.
 _start_container() {
-  lsmod | grep -q amneziawg || die "amneziawg kernel module not loaded. Run: sudo modprobe amneziawg"
+  lsmod | grep -q amneziawg \
+    || sudo modprobe amneziawg 2>/dev/null \
+    || die "amneziawg kernel module not found. Build it from: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
 
   local cmd="ip link add dev awg0 type amneziawg \
     && grep -v '^Address = ' '${CONFIG_DIR}/awg0.conf' | awg setconf awg0 /dev/stdin \
