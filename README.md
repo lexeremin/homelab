@@ -1,29 +1,30 @@
 # Homelab Manager
 
-Modular homelab management scripts for [AmneziaWireGuard](https://hub.docker.com/r/amneziavpn/amneziawg-go) VPN and [Headscale](https://headscale.net) control plane. Everything runs in Docker — no host-level packages required.
+Modular homelab management scripts. Everything runs in Docker — no host packages required.
 
-## Traffic flow (AmneziaWG)
+## Modules
 
-```
-Device → AmneziaWG (homelab) → OpenWrt → Podkop/sing-box → AmneziaVPN → Internet
-```
+### AmneziaWG
 
-Podkop on OpenWrt handles domain-based routing: blocked services (YouTube, Telegram, Discord) go through AmneziaVPN tunnel, everything else goes direct. DNS must point to OpenWrt (`192.168.1.1`) so sing-box fakeip routing works correctly.
+[AmneziaWireGuard](https://hub.docker.com/r/amneziavpn/amneziawg-go) — WireGuard with DPI obfuscation for networks that block plain WireGuard.
 
-## Requirements
-
-- Ubuntu 24.04 on homelab
-- Docker installed
-- **AmneziaWG only:** `amneziawg` kernel module built and installed on host
+**Prerequisites:**
+- `amneziawg` kernel module on the host — the container creates a kernel network interface (`ip link add type amneziawg`), which requires the module to be loaded
   - Build from: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module
-- OpenWrt router with Podkop configured
-- Port `51820/UDP` forwarded from ISP router → OpenWrt → homelab
+- Inbound UDP port forwarded to homelab
+
+### Headscale
+
+[Headscale](https://headscale.net) — self-hosted Tailscale control plane for a private mesh network between homelab nodes.
+
+**Prerequisites:**
+- A domain or IP reachable by all nodes (`SERVER_URL` in `.env`)
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# Edit .env — set ENDPOINT, SERVER_PORT, HOST_IFACE at minimum
+# Edit .env — fill in the relevant section(s)
 chmod +x homelab.sh
 ```
 
@@ -38,7 +39,7 @@ chmod +x homelab.sh
 ./homelab.sh amnezia remove-setup    # Full teardown
 
 # Headscale
-./homelab.sh headscale setup         # First-time setup (requires SERVER_URL in .env)
+./homelab.sh headscale setup         # First-time setup
 ./homelab.sh headscale create-user   # Create a Tailscale user
 ./homelab.sh headscale list-nodes    # List registered nodes
 ./homelab.sh headscale register-node # Register a node by key
@@ -61,8 +62,8 @@ Each AmneziaWG client gets a config file `homelab_NAME_YYYY_MM_DD.conf`. Import 
 | Path | Description |
 |------|-------------|
 | `homelab.sh` | Entry point — sources libs and modules |
-| `lib/common.sh` | Shared helpers (die, step, confirm, env_set, …) |
-| `lib/docker.sh` | Docker auto-detection (`$DOCKER`) |
+| `lib/common.sh` | Shared helpers |
+| `lib/docker.sh` | Docker auto-detection |
 | `modules/amnezia.sh` | AmneziaWG server + client management |
 | `modules/headscale.sh` | Headscale control plane management |
 | `.env.example` | Config template — copy to `.env` |
