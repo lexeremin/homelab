@@ -1,64 +1,18 @@
 #!/bin/bash
-# ══════════════════════════════════════════════════════════════════
-#  amnezia-setup.sh — AmneziaWG server + client manager
-# ══════════════════════════════════════════════════════════════════
-set -euo pipefail
+# ── AmneziaWG server + client manager ────────────────────────────
+# Sourced by homelab.sh — do not execute directly.
+[[ -n "${SCRIPT_DIR:-}" ]] || { echo "Source via homelab.sh" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+# ── Key generation helpers (via container, no wireguard-tools needed) ──
+_awg_run()     { $DOCKER run --rm "${IMAGE}" awg "$@"; }
+_gen_privkey() { _awg_run genkey; }
+_gen_pubkey()  { echo "$1" | $DOCKER run --rm -i "${IMAGE}" awg pubkey; }
+_gen_psk()     { _awg_run genpsk; }
 
-# ── Load .env ─────────────────────────────────────────────────────
-[[ -f "$ENV_FILE" ]] || {
-  echo "✗ .env not found — copy .env.example → .env and fill in your values."
-  exit 1
-}
-set -a; source "$ENV_FILE"; set +a
+# ── Config helpers ────────────────────────────────────────────────
+_conf_get() { sudo grep "^${1} = " "${CONFIG_DIR}/awg0.conf" | head -1 | awk '{print $3}'; }
 
-# ── Helpers ───────────────────────────────────────────────────────
-die()     { echo "✗ $*" >&2; exit 1; }
-step()    { echo ""; echo "▶ $*"; }
-info()    { echo "  $*"; }
-confirm() { read -rp "  $* [y/N] " r; [[ "${r,,}" == "y" ]]; }
-
-need() { command -v "$1" &>/dev/null || die "'$1' not found — $2"; }
-
-# ── Docker wrapper (auto-detects if sudo is needed) ───────────────
-if docker info &>/dev/null 2>&1; then
-  DOCKER="docker"
-elif sudo docker info &>/dev/null 2>&1; then
-  DOCKER="sudo docker"
-else
-  die "Docker not reachable. Install Docker or add user to docker group."
-fi
-
-# ── AmneziaWG key generation (via container, no wireguard-tools needed) ──
-awg_run()     { $DOCKER run --rm "${IMAGE}" awg "$@"; }
-gen_privkey() { awg_run genkey; }
-gen_pubkey()  { echo "$1" | $DOCKER run --rm -i "${IMAGE}" awg pubkey; }
-gen_psk()     { awg_run genpsk; }
-
-env_set() {
-  local key="$1" val="$2"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
-  else
-    echo "${key}=${val}" >> "$ENV_FILE"
-  fi
-}
-
-rand32() { od -An -tu4 -N4 /dev/urandom | tr -d ' \n'; }
-
-gen_h_values() {
-  H1=$(rand32)
-  H2=$(rand32); while [[ "$H2" == "$H1" ]]; do H2=$(rand32); done
-  H3=$(rand32); while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rand32); done
-  H4=$(rand32); while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rand32); done
-  export H1 H2 H3 H4
-}
-
-conf_get() { sudo grep "^${1} = " "${CONFIG_DIR}/awg0.conf" | head -1 | awk '{print $3}'; }
-
-next_client_ip() {
+_next_client_ip() {
   local last=0 n
   while read -r n; do
     [[ "$n" -gt "$last" ]] && last="$n"
@@ -67,17 +21,17 @@ next_client_ip() {
   echo "$((last + 1))"
 }
 
-list_clients() {
+_list_clients() {
   sudo grep "^# Client: " "${CONFIG_DIR}/awg0.conf" | sed 's/^# Client: //' || true
 }
 
-client_pubkey() {
+_client_pubkey() {
   local name="$1"
   sudo awk "/^# Client: ${name}$/{found=1} found && /^PublicKey/{print \$3; exit}" \
     "${CONFIG_DIR}/awg0.conf"
 }
 
-remove_client_block() {
+_remove_client_block() {
   local name="$1"
   sudo python3 - << EOF
 import re
@@ -93,23 +47,74 @@ with open("${CONFIG_DIR}/awg0.conf", "w") as f:
 EOF
 }
 
-is_setup()   { sudo test -f "${CONFIG_DIR}/awg0.conf"; }
-is_running() {
+_is_setup()   { sudo test -f "${CONFIG_DIR}/awg0.conf"; }
+_is_running() {
   [[ "$($DOCKER inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null)" == "running" ]]
 }
 
+_wait_for_container() {
+  local attempts=0
+  until _is_running; do
+    ((attempts++))
+    [[ $attempts -ge 20 ]] && {
+      echo ""
+      echo "  Container not starting. Check logs:"
+      echo "    $DOCKER logs ${CONTAINER_NAME}"
+      die "Container failed to start."
+    }
+    echo -n "."
+    sleep 2
+  done
+  echo ""
+}
+
+# ── sysctl: ip_forward on host (--sysctl incompatible with --network host) ──
+_ensure_sysctl() {
+  sudo sysctl -w net.ipv4.ip_forward=1
+  sudo sysctl -w net.ipv4.conf.all.src_valid_mark=1
+  sudo tee /etc/sysctl.d/99-homelab-awg.conf > /dev/null << 'EOF'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.src_valid_mark = 1
+EOF
+  info "sysctl rules persisted → /etc/sysctl.d/99-homelab-awg.conf"
+}
+
+# ── Container start (--network host: awg0 on host directly, no bridge NAT) ──
+_start_container() {
+  lsmod | grep -q amneziawg \
+    || sudo modprobe amneziawg 2>/dev/null \
+    || die "amneziawg kernel module not found. Build from: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
+
+  local cmd="ip link add dev awg0 type amneziawg \
+    && grep -v '^Address = ' '${CONFIG_DIR}/awg0.conf' | awg setconf awg0 /dev/stdin \
+    && ip addr add '${VPN_PREFIX}.1/24' dev awg0 \
+    && ip link set awg0 up \
+    && iptables -t nat -A POSTROUTING -s '${VPN_PREFIX}.0/24' -o ${HOST_IFACE} -j MASQUERADE \
+    && exec sleep infinity"
+
+  $DOCKER run -d \
+    --name "${CONTAINER_NAME}" \
+    --network host \
+    --cap-add NET_ADMIN \
+    --cap-add SYS_MODULE \
+    -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+    --restart unless-stopped \
+    "${IMAGE}" \
+    sh -c "${cmd}"
+}
+
 # ══════════════════════════════════════════════════════════════════
-menu_setup() {
-  is_setup && { echo "  Server already set up. Run 'remove setup' first to reset."; return; }
+amnezia_setup() {
+  _is_setup && { echo "  Server already set up. Run 'remove-setup' first to reset."; return; }
   need docker "https://docs.docker.com/engine/install/"
 
   step "Pulling image: ${IMAGE}"
   $DOCKER pull "${IMAGE}"
 
   step "Generating server keys (via awg)"
-  SERVER_PRIVKEY=$(gen_privkey)
-  SERVER_PUBKEY=$(gen_pubkey "$SERVER_PRIVKEY")
-  PSK=$(gen_psk)
+  SERVER_PRIVKEY=$(_gen_privkey)
+  SERVER_PUBKEY=$(_gen_pubkey "$SERVER_PRIVKEY")
+  PSK=$(_gen_psk)
   info "Server pubkey: ${SERVER_PUBKEY}"
 
   step "Generating Amnezia H values"
@@ -121,7 +126,7 @@ menu_setup() {
   sudo tee "${CONFIG_DIR}/awg0.conf" > /dev/null << EOF
 [Interface]
 PrivateKey = ${SERVER_PRIVKEY}
-Address = ${VPN_PREFIX}.0/24
+Address = ${VPN_PREFIX}.1/24
 ListenPort = ${SERVER_PORT}
 Jc = ${JC}
 Jmin = ${JMIN}
@@ -147,89 +152,38 @@ EOF
   env_set PSK            "$PSK"
   env_set H1 "$H1"; env_set H2 "$H2"; env_set H3 "$H3"; env_set H4 "$H4"
 
-  step "Creating Docker network (bridge: ${DOCKER_BRIDGE})"
-  $DOCKER network create \
-    --driver bridge \
-    --opt com.docker.network.bridge.name="${DOCKER_BRIDGE}" \
-    "${DOCKER_NET}" 2>/dev/null && info "Created" || info "Already exists"
+  step "Enabling ip_forward on host"
+  _ensure_sysctl
 
   step "Starting container: ${CONTAINER_NAME}"
   $DOCKER rm -f "${CONTAINER_NAME}" 2>/dev/null || true
   _start_container
   info "Container running"
 
-  step "Setting up host iptables FORWARD rules"
-  _setup_iptables
-
   echo ""
   echo "✓ Setup complete."
 }
 
-# Start (or restart) the AmneziaWG container.
-# Requires the amneziawg kernel module loaded on the host.
-# The container uses 'ip link add type amneziawg' to create a kernel interface,
-# then awg setconf to apply config, then iptables MASQUERADE for client NAT.
-_start_container() {
-  lsmod | grep -q amneziawg \
-    || sudo modprobe amneziawg 2>/dev/null \
-    || die "amneziawg kernel module not found. Build it from: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
-
-  local cmd="ip link add dev awg0 type amneziawg \
-    && grep -v '^Address = ' '${CONFIG_DIR}/awg0.conf' | awg setconf awg0 /dev/stdin \
-    && ip addr add '${VPN_PREFIX}.0/24' dev awg0 \
-    && ip link set awg0 up \
-    && iptables -t nat -A POSTROUTING -s '${VPN_PREFIX}.0/24' -o eth0 -j MASQUERADE \
-    && exec sleep infinity"
-
-  $DOCKER run -d \
-    --name "${CONTAINER_NAME}" \
-    --network "${DOCKER_NET}" \
-    --cap-add NET_ADMIN \
-    --cap-add SYS_MODULE \
-    --sysctl net.ipv4.ip_forward=1 \
-    --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-    -v "${CONFIG_DIR}:${CONFIG_DIR}" \
-    -p "${SERVER_PORT}:${SERVER_PORT}/udp" \
-    --restart unless-stopped \
-    "${IMAGE}" \
-    sh -c "${cmd}"
-}
-
-_setup_iptables() {
-  sudo iptables -C FORWARD -i "${DOCKER_BRIDGE}" -o "${HOST_IFACE}" -j ACCEPT 2>/dev/null \
-    || sudo iptables -I FORWARD -i "${DOCKER_BRIDGE}" -o "${HOST_IFACE}" -j ACCEPT
-
-  sudo iptables -C FORWARD -i "${HOST_IFACE}" -o "${DOCKER_BRIDGE}" \
-    -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-    || sudo iptables -I FORWARD -i "${HOST_IFACE}" -o "${DOCKER_BRIDGE}" \
-       -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-  command -v netfilter-persistent &>/dev/null \
-    || sudo apt-get install -y -q iptables-persistent
-  sudo netfilter-persistent save
-  info "Rules persisted"
-}
-
 # ══════════════════════════════════════════════════════════════════
-menu_add_client() {
-  is_setup || die "Server not set up. Run setup first."
+amnezia_add_client() {
+  _is_setup || die "Server not set up. Run setup first."
 
   read -rp "  Client name: " name
   [[ -n "$name" ]] || die "Name cannot be empty."
-  list_clients | grep -qx "$name" && die "Client '${name}' already exists."
+  _list_clients | grep -qx "$name" && die "Client '${name}' already exists."
 
   step "Generating keys for '${name}'"
-  CLIENT_PRIVKEY=$(gen_privkey)
-  CLIENT_PUBKEY=$(gen_pubkey "$CLIENT_PRIVKEY")
+  CLIENT_PRIVKEY=$(_gen_privkey)
+  CLIENT_PUBKEY=$(_gen_pubkey "$CLIENT_PRIVKEY")
 
-  _JC=$(conf_get Jc);   _JMIN=$(conf_get Jmin); _JMAX=$(conf_get Jmax)
-  _S1=$(conf_get S1);   _S2=$(conf_get S2);     _S3=$(conf_get S3); _S4=$(conf_get S4)
-  _H1=$(conf_get H1);   _H2=$(conf_get H2);     _H3=$(conf_get H3); _H4=$(conf_get H4)
+  _JC=$(_conf_get Jc);   _JMIN=$(_conf_get Jmin); _JMAX=$(_conf_get Jmax)
+  _S1=$(_conf_get S1);   _S2=$(_conf_get S2);     _S3=$(_conf_get S3); _S4=$(_conf_get S4)
+  _H1=$(_conf_get H1);   _H2=$(_conf_get H2);     _H3=$(_conf_get H3); _H4=$(_conf_get H4)
   _SERVER_PUBKEY=$(sudo cat "${CONFIG_DIR}/wireguard_server_public_key.key")
   _PSK=$(sudo cat "${CONFIG_DIR}/wireguard_psk.key")
 
   local n CLIENT_VPN_IP
-  n=$(next_client_ip)
+  n=$(_next_client_ip)
   CLIENT_VPN_IP="${VPN_PREFIX}.${n}"
   info "Assigned IP: ${CLIENT_VPN_IP}"
 
@@ -286,27 +240,11 @@ EOF
   echo "  Import into Amnezia app. Delete file after importing."
 }
 
-_wait_for_container() {
-  local attempts=0
-  until is_running; do
-    ((attempts++))
-    [[ $attempts -ge 20 ]] && {
-      echo ""
-      echo "  Container not starting. Check logs:"
-      echo "    $DOCKER logs ${CONTAINER_NAME}"
-      die "Container failed to start."
-    }
-    echo -n "."
-    sleep 2
-  done
-  echo ""
-}
-
 # ══════════════════════════════════════════════════════════════════
-menu_remove_client() {
-  is_setup || die "Server not set up."
+amnezia_remove_client() {
+  _is_setup || die "Server not set up."
 
-  mapfile -t clients < <(list_clients)
+  mapfile -t clients < <(_list_clients)
   [[ ${#clients[@]} -gt 0 ]] || { echo "  No clients found."; return; }
 
   echo ""
@@ -323,25 +261,25 @@ menu_remove_client() {
   confirm "Remove client '${name}'?" || { echo "  Aborted."; return; }
 
   local pubkey
-  pubkey=$(client_pubkey "$name")
+  pubkey=$(_client_pubkey "$name")
   [[ -n "$pubkey" ]] || die "Could not find public key for '${name}'."
 
   step "Removing peer from running interface"
   $DOCKER exec "${CONTAINER_NAME}" awg set awg0 peer "${pubkey}" remove
 
   step "Removing peer from server config"
-  remove_client_block "$name"
+  _remove_client_block "$name"
 
   echo ""
   echo "✓ Client '${name}' removed."
 }
 
 # ══════════════════════════════════════════════════════════════════
-menu_status() {
+amnezia_status() {
   echo ""
-  if is_setup; then
+  if _is_setup; then
     info "Config:    ${CONFIG_DIR}/awg0.conf"
-    if is_running; then
+    if _is_running; then
       info "Container: running"
       echo ""
       $DOCKER exec "${CONTAINER_NAME}" awg show awg0
@@ -354,13 +292,12 @@ menu_status() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-menu_remove_setup() {
+amnezia_remove_setup() {
   echo ""
   echo "  This will:"
   echo "    • Stop and remove container '${CONTAINER_NAME}'"
-  echo "    • Remove Docker network '${DOCKER_NET}'"
   echo "    • Remove config directory '${CONFIG_DIR}'"
-  echo "    • Remove iptables FORWARD rules"
+  echo "    • Remove iptables MASQUERADE rule"
   echo "    • Clear credentials from .env"
   echo ""
   confirm "Proceed with full teardown?" || { echo "  Aborted."; return; }
@@ -368,18 +305,16 @@ menu_remove_setup() {
   step "Stopping container"
   $DOCKER rm -f "${CONTAINER_NAME}" 2>/dev/null && info "Removed" || info "Not running"
 
-  step "Removing Docker network"
-  $DOCKER network rm "${DOCKER_NET}" 2>/dev/null && info "Removed" || info "Not found"
+  step "Removing awg0 interface (if present)"
+  sudo ip link del awg0 2>/dev/null && info "Removed awg0" || info "awg0 not found"
+
+  step "Removing iptables MASQUERADE rule"
+  sudo iptables -t nat -D POSTROUTING -s "${VPN_PREFIX}.0/24" -o "${HOST_IFACE}" -j MASQUERADE 2>/dev/null || true
+  sudo netfilter-persistent save 2>/dev/null || true
+  info "Rules removed"
 
   step "Removing config directory"
   sudo rm -rf "${CONFIG_DIR}" && info "Removed ${CONFIG_DIR}"
-
-  step "Removing iptables FORWARD rules"
-  sudo iptables -D FORWARD -i "${DOCKER_BRIDGE}" -o "${HOST_IFACE}" -j ACCEPT 2>/dev/null || true
-  sudo iptables -D FORWARD -i "${HOST_IFACE}" -o "${DOCKER_BRIDGE}" \
-    -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  sudo netfilter-persistent save 2>/dev/null || true
-  info "Rules removed"
 
   step "Clearing credentials from .env"
   for key in SERVER_PRIVKEY SERVER_PUBKEY PSK H1 H2 H3 H4; do
@@ -391,14 +326,14 @@ menu_remove_setup() {
 }
 
 # ══════════════════════════════════════════════════════════════════
-show_menu() {
+amnezia_menu() {
   echo ""
   echo "  ┌─────────────────────────────┐"
   echo "  │     AmneziaWG Manager       │"
   echo "  ├─────────────────────────────┤"
-  if is_running; then
+  if _is_running; then
     echo "  │  Server: ✓ running          │"
-  elif is_setup; then
+  elif _is_setup; then
     echo "  │  Server: ⚠ config exists    │"
   else
     echo "  │  Server: ✗ not set up       │"
@@ -409,32 +344,32 @@ show_menu() {
   echo "  │  3) Remove client           │"
   echo "  │  4) Status / peers          │"
   echo "  │  5) Remove setup            │"
-  echo "  │  0) Exit                    │"
+  echo "  │  0) Back                    │"
   echo "  └─────────────────────────────┘"
   echo ""
   read -rp "  Choice: " choice
 
   case "$choice" in
-    1) menu_setup ;;
-    2) menu_add_client ;;
-    3) menu_remove_client ;;
-    4) menu_status ;;
-    5) menu_remove_setup ;;
-    0) exit 0 ;;
+    1) amnezia_setup ;;
+    2) amnezia_add_client ;;
+    3) amnezia_remove_client ;;
+    4) amnezia_status ;;
+    5) amnezia_remove_setup ;;
+    0) return ;;
     *) echo "  Invalid choice." ;;
   esac
 }
 
-# ── Entry point ───────────────────────────────────────────────────
-case "${1:-}" in
-  setup)          menu_setup ;;
-  add-client)     menu_add_client ;;
-  remove-client)  menu_remove_client ;;
-  status)         menu_status ;;
-  remove-setup)   menu_remove_setup ;;
-  "")             while true; do show_menu; done ;;
-  *)
-    echo "Usage: $0 [setup|add-client|remove-client|status|remove-setup]"
-    echo "       $0          — interactive menu"
-    ;;
-esac
+amnezia_dispatch() {
+  case "${1:-}" in
+    setup)          amnezia_setup ;;
+    add-client)     amnezia_add_client ;;
+    remove-client)  amnezia_remove_client ;;
+    status)         amnezia_status ;;
+    remove-setup)   amnezia_remove_setup ;;
+    "")             while true; do amnezia_menu; done ;;
+    *)
+      echo "Usage: homelab.sh amnezia [setup|add-client|remove-client|status|remove-setup]"
+      ;;
+  esac
+}
