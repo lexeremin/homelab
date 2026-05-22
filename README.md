@@ -1,8 +1,8 @@
-# Homelab AmneziaWG VPN
+# Homelab Manager
 
-Full-tunnel VPN to homelab via [AmneziaWireGuard](https://hub.docker.com/r/amneziavpn/amneziawg-go) — a WireGuard implementation with DPI obfuscation. All client traffic routes through homelab → OpenWrt (Podkop) for transparent DPI bypass.
+Modular homelab management scripts for [AmneziaWireGuard](https://hub.docker.com/r/amneziavpn/amneziawg-go) VPN and [Headscale](https://headscale.net) control plane. Everything runs in Docker — no host-level packages required.
 
-## Traffic flow
+## Traffic flow (AmneziaWG)
 
 ```
 Device → AmneziaWG (homelab) → OpenWrt → Podkop/sing-box → AmneziaVPN → Internet
@@ -14,7 +14,8 @@ Podkop on OpenWrt handles domain-based routing: blocked services (YouTube, Teleg
 
 - Ubuntu 24.04 on homelab
 - Docker installed
-- `wireguard-tools` (`apt install wireguard-tools`)
+- **AmneziaWG only:** `amneziawg` kernel module built and installed on host
+  - Build from: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module
 - OpenWrt router with Podkop configured
 - Port `51820/UDP` forwarded from ISP router → OpenWrt → homelab
 
@@ -22,51 +23,54 @@ Podkop on OpenWrt handles domain-based routing: blocked services (YouTube, Teleg
 
 ```bash
 cp .env.example .env
-# Edit .env — set ENDPOINT and SERVER_PORT at minimum
-chmod +x amnezia-setup.sh
-./amnezia-setup.sh
+# Edit .env — set ENDPOINT, SERVER_PORT, HOST_IFACE at minimum
+chmod +x homelab.sh
 ```
 
 ## Usage
 
-Run without arguments for interactive menu:
+```bash
+# AmneziaWG
+./homelab.sh amnezia setup           # First-time server setup
+./homelab.sh amnezia add-client      # Add a client (prompts for name)
+./homelab.sh amnezia remove-client   # Remove a client (interactive list)
+./homelab.sh amnezia status          # Show container state + peers
+./homelab.sh amnezia remove-setup    # Full teardown
 
+# Headscale
+./homelab.sh headscale setup         # First-time setup (requires SERVER_URL in .env)
+./homelab.sh headscale create-user   # Create a Tailscale user
+./homelab.sh headscale list-nodes    # List registered nodes
+./homelab.sh headscale register-node # Register a node by key
+./homelab.sh headscale status        # Show container state + node list
+./homelab.sh headscale remove-setup  # Full teardown
 ```
-./amnezia-setup.sh
 
-  ┌─────────────────────────────┐
-  │     AmneziaWG Manager       │
-  ├─────────────────────────────┤
-  │  1) Setup server            │
-  │  2) Add client              │
-  │  3) Remove client           │
-  │  4) Remove setup            │
-  │  0) Exit                    │
-  └─────────────────────────────┘
-```
-
-Or call subcommands directly:
+Run without a subcommand for an interactive menu:
 
 ```bash
-./amnezia-setup.sh setup           # First-time server setup
-./amnezia-setup.sh add-client      # Add a client (prompts for name)
-./amnezia-setup.sh remove-client   # Remove a client (interactive list)
-./amnezia-setup.sh remove-setup    # Full teardown
+./homelab.sh
+./homelab.sh amnezia
+./homelab.sh headscale
 ```
 
-Each client gets a config file named `homelab_NAME_YYYY_MM_DD.conf`. Import it into the [Amnezia app](https://amnezia.org) on your device. Delete the file after importing — it contains the private key.
+Each AmneziaWG client gets a config file `homelab_NAME_YYYY_MM_DD.conf`. Import it into the [Amnezia app](https://amnezia.org). Delete after importing — it contains the private key.
 
 ## Files
 
-| File | Description |
+| Path | Description |
 |------|-------------|
+| `homelab.sh` | Entry point — sources libs and modules |
+| `lib/common.sh` | Shared helpers (die, step, confirm, env_set, …) |
+| `lib/docker.sh` | Docker auto-detection (`$DOCKER`) |
+| `modules/amnezia.sh` | AmneziaWG server + client management |
+| `modules/headscale.sh` | Headscale control plane management |
 | `.env.example` | Config template — copy to `.env` |
 | `.env` | Your config + generated credentials (gitignored) |
-| `amnezia-setup.sh` | Setup and management script |
 | `homelab_NAME_DATE.conf` | Generated client configs (gitignored) |
 
 ## Security notes
 
 - `.env` and `*.conf` are gitignored — never commit them
-- Each device gets its own key pair — revoke per device with "Remove client"
+- Each device gets its own key pair — revoke per device with `remove-client`
 - The server never stores client private keys
